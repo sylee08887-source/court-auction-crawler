@@ -20,3 +20,7 @@ __pycache__/
 *.pyc
 *.pyo
 .env
+
+# 실거래가 DB
+realestate.db
+realestate.db-journal

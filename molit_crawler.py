@@ -31,7 +31,7 @@ DISTRICTS = {
 
 FIELDNAMES = [
     "구", "읍면동", "지번", "오피스텔명", "전용면적(㎡)",
-    "계약년도", "계약월", "계약일", "거래금액(만원)",
+    "계약년도", "계약월", "계약일", "계약년월일", "거래금액(만원)",
     "층", "건축년도", "거래유형", "해제여부", "해제사유발생일",
     "중개사소재지", "매도자구분", "매수자구분",
 ]
@@ -44,7 +44,7 @@ def parse_args():
 
     start_ym = args[0] if len(args) >= 1 else f"{prev_year}01"
     end_ym   = args[1] if len(args) >= 2 else f"{prev_year}12"
-    out_file = args[2] if len(args) >= 3 else "court_results.csv"
+    out_file = args[2] if len(args) >= 3 else "molit_all.csv"
 
     if len(start_ym) != 6 or len(end_ym) != 6:
         print("오류: 기간은 YYYYMM 형식으로 입력하세요. 예) 202401 202512")
@@ -88,15 +88,20 @@ def parse_response(xml_text):
 
     items = []
     for item in root.findall(".//item"):
+        deal_year = item.findtext("dealYear", "").strip()
+        deal_month = item.findtext("dealMonth", "").strip()
+        deal_day = item.findtext("dealDay", "").strip()
+        deal_date = f"{deal_year}-{deal_month.zfill(2)}-{deal_day.zfill(2)}" if deal_year and deal_month and deal_day else ""
         items.append({
             "구":             item.findtext("sggNm", "").strip(),
             "읍면동":         item.findtext("umdNm", "").strip(),
             "지번":           item.findtext("jibun", "").strip(),
             "오피스텔명":     item.findtext("offiNm", "").strip(),
             "전용면적(㎡)":   item.findtext("excluUseAr", "").strip(),
-            "계약년도":       item.findtext("dealYear", "").strip(),
-            "계약월":         item.findtext("dealMonth", "").strip(),
-            "계약일":         item.findtext("dealDay", "").strip(),
+            "계약년도":       deal_year,
+            "계약월":         deal_month,
+            "계약일":         deal_day,
+            "계약년월일":     deal_date,
             "거래금액(만원)": item.findtext("dealAmount", "").strip().replace(",", ""),
             "층":             item.findtext("floor", "").strip(),
             "건축년도":       item.findtext("buildYear", "").strip(),
