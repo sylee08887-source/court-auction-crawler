@@ -58,18 +58,28 @@ def check_court(rows, label):
 def check_combined(rows):
     if not rows:
         return
-    matched = [r for r in rows if parse_int(r.get("매칭수")) and parse_int(r.get("매칭수")) > 0]
-    missing_avg = [r for r in matched if not r.get("시세평균(만원)")]
+    est = [r for r in rows if parse_int(r.get("추정시세(만원)"))]
     bad_unit = [
         r for r in rows
         if parse_int(r.get("감정가(만원)")) and parse_int(r.get("감정가(만원)")) > 1_000_000
     ]
-    cases = {r.get("사건번호") for r in rows if r.get("사건번호")}
-    matched_cases = {r.get("사건번호") for r in matched if r.get("사건번호")}
-    print(f"[combined_result.csv] {len(rows)}행 / 사건 {len(cases)}건")
-    print(f"  매칭 성공 사건: {len(matched_cases)}건")
-    print(f"  매칭수>0인데 시세평균 누락: {len(missing_avg)}행")
+    conf = {}
+    for r in est:
+        conf[r.get("시세신뢰도") or "(없음)"] = conf.get(r.get("시세신뢰도") or "(없음)", 0) + 1
+    outliers = [r for r in est if r.get("낙찰가/시세(%)") and not 20 <= float(r["낙찰가/시세(%)"]) <= 200]
+    print(f"[combined_result.csv] {len(rows)}행 (물건당 1행)")
+    print(f"  시세 산출: {len(est)}행 ({len(est) / len(rows) * 100:.1f}%) / 신뢰도 {conf}")
+    print(f"  낙찰가/시세 20~200% 밖: {len(outliers)}행")
     print(f"  감정가 단위 의심: {len(bad_unit)}행")
+
+
+def check_upcoming(rows):
+    if not rows:
+        return
+    judge = {}
+    for r in rows:
+        judge[r.get("판단") or "(일반)"] = judge.get(r.get("판단") or "(일반)", 0) + 1
+    print(f"[upcoming_bids.csv] {len(rows)}행 / 판단 {judge}")
 
 
 def main():
@@ -77,6 +87,7 @@ def main():
     check_court(load_csv("court_auction_expanded.csv"), "court_auction_expanded.csv")
     check_molit(load_csv("molit_all.csv"))
     check_combined(load_csv("combined_result.csv"))
+    check_upcoming(load_csv("upcoming_bids.csv"))
 
 
 if __name__ == "__main__":

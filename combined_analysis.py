@@ -47,11 +47,11 @@ AUCTION_FIELDS = [
 MATCH_FIELDS = [
     "구", "법정동", "지번", "건물명", "층", "전용면적(㎡)",
     "매칭방식", "실거래유형", "매칭건물명", "매칭지번", "건물명유사도", "후보거래수",
-    "비교거래수", "비교기간", "시세산출", "추정시세(만원)", "최근비교거래일",
+    "비교거래수", "비교기간", "시세산출", "시세신뢰도", "시점보정(평균)", "추정시세(만원)", "최근비교거래일",
     "낙찰가/시세(%)", "최저가/시세(%)", "감정가/시세(%)", "매칭비고",
 ]
 DETAIL_FIELDS = ["사건번호", "물건번호", "매각기일", "매칭_건물명", "매칭_법정동", "매칭_지번",
-                 "매칭_계약일", "매칭_거래금액(만원)", "매칭_전용면적(㎡)", "매칭_층", "매칭_㎡당가(만원)"]
+                 "매칭_계약일", "매칭_거래금액(만원)", "매칭_전용면적(㎡)", "매칭_층", "매칭_㎡당가(만원)", "매칭_시점보정"]
 
 
 def parse_int(val):
@@ -129,6 +129,7 @@ def main():
                 "매칭_계약일": d["deal_date"], "매칭_거래금액(만원)": d["price"],
                 "매칭_전용면적(㎡)": d["area"], "매칭_층": d.get("floor", ""),
                 "매칭_㎡당가(만원)": round(d["price"] / d["area"], 1) if d["area"] else "",
+                "매칭_시점보정": d.get("adj", ""),
             })
 
     write_csv(OUTPUT_CSV, AUCTION_FIELDS + MATCH_FIELDS, results)
@@ -140,6 +141,7 @@ def main():
     print(f"  시세 산출:   {len(matched):,}건 ({len(matched) / max(len(results), 1) * 100:.1f}%)")
     print("  매칭방식:   " + ", ".join(f"{k} {v}" for k, v in Counter(r["매칭방식"] for r in results).most_common()))
     print("  실거래유형: " + ", ".join(f"{k} {v}" for k, v in Counter(r["실거래유형"] for r in matched).most_common()))
+    print("  시세신뢰도: " + ", ".join(f"{k} {v}" for k, v in sorted(Counter(r["시세신뢰도"] for r in matched).items())))
     how = Counter(r["시세산출"].split(" ")[0] for r in matched)
     print("  시세산출:   " + ", ".join(f"{k} {v}" for k, v in how.most_common()))
     fails = Counter(r["매칭비고"] for r in results if r["추정시세(만원)"] == "")

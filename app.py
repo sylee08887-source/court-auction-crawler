@@ -14,8 +14,10 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+import rt_bid
 import rt_core
 from rt_core import DATASETS, KOREAN
+from rt_match import MultiIndex
 from rt_regions import CODE_TO_NAME, PRESETS, region_label
 
 PYEONG = 3.3058
@@ -158,8 +160,8 @@ df = df.sort_values("deal_date", ascending=False)
 
 # ── 화면 ───────────────────────────────────────────
 
-tab_search, tab_complex, tab_trend, tab_auction, tab_update = st.tabs(
-    ["🔎 거래 검색", "🏢 단지별", "📈 추이", "⚖️ 경매 vs 시세", "⬇️ 데이터 업데이트"])
+tab_search, tab_complex, tab_trend, tab_bid, tab_auction, tab_update = st.tabs(
+    ["🔎 거래 검색", "🏢 단지별", "📈 추이", "🎯 입찰 도우미", "⚖️ 경매 vs 시세", "⬇️ 데이터 업데이트"])
 
 
 def show_metrics(d):
@@ -266,6 +268,138 @@ with tab_trend:
         ).properties(height=220, title="월별 거래 건수"), width="stretch")
         st.caption("최근 1~2개월은 신고 기한(계약 후 30일) 때문에 건수가 적게 집계됩니다.")
 
+@st.cache_resource(show_spinner="실거래 색인 만드는 중...")
+def market_index():
+    return MultiIndex.from_db()
+
+
+@st.cache_data(show_spinner="입찰 예정 물건 평가 중...")
+def bid_table():
+    if not (BASE_DIR / rt_bid.ARCHIVE_CSV).exists():
+        return pd.DataFrame(), {}
+    upcoming = rt_bid.load_upcoming(BASE_DIR / rt_bid.ARCHIVE_CSV)
+    rows, comps = rt_bid.evaluate(upcoming, market_index(), bid_history())
+    df = pd.DataFrame(rows)
+    for c in ["층", "전용면적(㎡)", "유찰횟수", "최저가/시세(%)", "감정가/시세(%)", "시점보정(평균)"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df, {f"{k[0]}|{k[1]}": v for k, v in comps.items()}
+
+
+@st.cache_resource
+def bid_history():
+    return rt_bid.History(BASE_DIR / rt_bid.HISTORY_CSV)
+
+
+ACQ_TAX_RATE = 0.046  # 오피스텔(비주택) 취득세+지방교육세+농특세 합계 기준
+
+with tab_bid:
+    bids, comps = bid_table()
+    if bids.empty:
+        st.info("입찰 예정 물건이 없습니다. '⬇️ 데이터 업데이트' 탭에서 경매 수집을 실행하세요.")
+    else:
+        st.caption("예상 낙찰가 = 최저가 × 과거 같은 구·유찰횟수 물건의 (낙찰가/최저가) 하위25%·중위·상위25%. "
+                   "추정시세 = 같은 건물·비슷한 면적 실거래(시점 보정). "
+                   "권리관계(대항력 있는 임차인 등)는 반영되지 않습니다.")
+        g1, g2, g3, g4 = st.columns([2, 3, 2, 2])
+        b_gu = g1.multiselect("구", sorted(bids["구"].dropna().unique()), key="bid_gu")
+        judge_all = bids["판단"].fillna("").replace("", "(일반)")
+        judge_opts = list(judge_all.value_counts().index)
+        b_judge = g2.multiselect("판단", judge_opts, key="bid_judge",
+                                 default=[j for j in judge_opts if j.startswith(("시세 대비 저가", "저가 예상"))])
+        b_conf = g3.multiselect("시세 신뢰도", ["상", "중", "하"], default=["상", "중", "하"], key="bid_conf")
+        b_max = g4.number_input("최저가 상한(만원, 0=없음)", min_value=0, value=0, step=1000, key="bid_max")
+        dts = pd.to_datetime(bids["매각기일"])
+        dmin, dmax = dts.min().date(), dts.max().date()
+        b_dates = st.slider("매각기일", min_value=dmin, max_value=dmax, value=(dmin, dmax), key="bid_dates")
+
+        v = bids.assign(판단=judge_all)
+        if b_gu:
+            v = v[v["구"].isin(b_gu)]
+        if b_judge:
+            v = v[v["판단"].isin(b_judge)]
+        if b_conf:
+            v = v[v["시세신뢰도"].isin(b_conf) | v["시세신뢰도"].fillna("").eq("")]
+        if b_max:
+            v = v[v["최저입찰가(만원)"] <= b_max]
+        v = v[pd.to_datetime(v["매각기일"]).dt.date.between(*b_dates)]
+        v = v.sort_values(["예상중위/시세(%)", "매각기일"], na_position="last")
+
+        c = st.columns(4)
+        c[0].metric("입찰 예정 (필터 후)", f"{len(v):,} / {len(bids):,}건")
+        c[1].metric("시세 대비 저가 예상", f"{(judge_all == '시세 대비 저가 예상').sum():,}건")
+        c[2].metric("권리관계 확인 필요", f"{judge_all.str.startswith('⚠️').sum():,}건")
+        c[3].metric("최저가 ≥ 시세", f"{judge_all.str.startswith('최저가 ≥').sum():,}건")
+
+        cols = ["매각기일", "사건번호", "물건번호", "판단", "구", "법정동", "건물명", "층", "전용면적(㎡)", "유찰횟수",
+                "감정가(만원)", "최저입찰가(만원)", "예상낙찰가_하(만원)", "예상낙찰가_중(만원)", "예상낙찰가_상(만원)",
+                "추정시세(만원)", "예상중위/시세(%)", "최저가/시세(%)", "시세신뢰도", "비교기간", "소재지"]
+        ev = st.dataframe(v[cols], hide_index=True, width="stretch", height=420, on_select="rerun",
+                          selection_mode="single-row", key="bid_table")
+        st.download_button("CSV 다운로드", csv_bytes(v[cols]), file_name="입찰예정.csv", mime="text/csv")
+
+        if ev.selection.rows:
+            r = v.iloc[ev.selection.rows[0]]
+            minimum = r["최저입찰가(만원)"]
+            market = r["추정시세(만원)"]
+            st.markdown(f"### {r['사건번호']} ({r['물건번호']}) · {r['건물명'] or ''} {r['전용면적(㎡)']}㎡")
+            st.caption(f"{r['소재지']} · 매각기일 {r['매각기일']} · 유찰 {r['유찰횟수']}회 · "
+                       "법원경매정보(courtauction.go.kr)에서 사건번호로 매각물건명세서를 확인하세요.")
+            if str(r["판단"]).startswith("⚠️"):
+                st.error("유찰이 많거나 최저가가 시세보다 지나치게 낮습니다. 대항력 있는 임차인의 보증금 인수, "
+                         "선순위 권리 등으로 실제 부담이 낙찰가보다 클 가능성이 높습니다.")
+            else:
+                st.warning("이 계산에는 권리관계가 반영되지 않습니다. 입찰 전 매각물건명세서·등기부·전입세대열람으로 "
+                           "인수할 권리가 없는지 반드시 확인하세요.")
+            k = st.columns(4)
+            k[0].metric("최저입찰가", fmt_won(minimum), f"보증금 {fmt_won(r['입찰보증금(만원)'])}", delta_color="off")
+            k[1].metric("예상 낙찰가(중위)", fmt_won(r["예상낙찰가_중(만원)"]),
+                        f"{fmt_won(r['예상낙찰가_하(만원)'])} ~ {fmt_won(r['예상낙찰가_상(만원)'])}", delta_color="off")
+            k[2].metric("추정시세", fmt_won(market),
+                        f"신뢰도 {r['시세신뢰도'] or '-'} · {r['비교기간'] or ''}", delta_color="off")
+            k[3].metric("감정가", fmt_won(r["감정가(만원)"]))
+
+            st.markdown("#### 입찰가 계산기")
+            floor_bid = int(minimum) if pd.notna(minimum) else 0
+            mid = r["예상낙찰가_중(만원)"]
+            default_bid = max(int(mid) if pd.notna(mid) else floor_bid, floor_bid)
+            my_bid = st.number_input("내 입찰가 (만원)", min_value=floor_bid, value=default_bid, step=100,
+                                     key=f"mybid_{r['사건번호']}_{r['물건번호']}")
+            hist = bid_history()
+            bucket = rt_bid.yuchal_bucket(r["유찰횟수"])
+            to_min = my_bid / minimum * 100 if floor_bid else None
+            share, basis = rt_bid.win_share(hist, r["구"], bucket, to_min) if to_min else (None, "")
+            tax = my_bid * ACQ_TAX_RATE
+            kc = st.columns(4)
+            kc[0].metric("최저가 대비", f"{to_min:.1f}%" if to_min else "-")
+            kc[1].metric("시세 대비", f"{my_bid / market * 100:.1f}%" if pd.notna(market) and market else "-")
+            kc[2].metric("과거 낙찰가보다 높았을 비율", f"{share:.0f}%" if share is not None else "-",
+                         basis, delta_color="off")
+            kc[3].metric("취득세 포함 총액(추정)", fmt_won(my_bid + tax), f"취득세 등 4.6% {fmt_won(tax)}",
+                         delta_color="off")
+            st.caption("'과거 낙찰가보다 높았을 비율' = 같은 조건 과거 낙찰 사례 중 (낙찰가/최저가)가 내 입찰가 비율 이하였던 비중. "
+                       "낙찰 확률의 대략적 참고치이며 경쟁자 수는 반영하지 않습니다. 취득세율은 오피스텔(비주택) 일반 기준이며 "
+                       "주택 수·감면 여부에 따라 다릅니다.")
+
+            s_hist, _ = hist.samples(rt_bid.RATIO_COL, r["구"], bucket)
+            if not s_hist.empty and to_min:
+                hd = pd.DataFrame({"ratio": s_hist.values})
+                bars = alt.Chart(hd).mark_bar(opacity=0.7).encode(
+                    x=alt.X("ratio:Q", bin=alt.Bin(step=2), title="과거 낙찰가/최저가(%)"),
+                    y=alt.Y("count():Q", title="건수"))
+                rule = alt.Chart(pd.DataFrame({"x": [to_min]})).mark_rule(color="red", size=2).encode(x="x:Q")
+                st.altair_chart((bars + rule).properties(height=200, title=f"과거 분포 ({basis}) · 빨간선 = 내 입찰가"),
+                                width="stretch")
+
+            used = comps.get(f"{r['사건번호']}|{r['물건번호']}", [])
+            if used:
+                cd = pd.DataFrame(used)
+                cd["㎡당가(보정)"] = (cd["price"] * cd["adj"] / cd["area"]).round(0)
+                cd = cd.rename(columns={"deal_date": "계약일", "name": "건물명", "area": "전용면적(㎡)",
+                                        "price": "거래금액(만원)", "floor": "층", "adj": "시점보정", "jibun": "지번"})
+                st.markdown(f"#### 시세 산출에 쓴 실거래 ({len(cd)}건 · {r['시세산출']})")
+                st.dataframe(cd[["계약일", "건물명", "지번", "전용면적(㎡)", "층", "거래금액(만원)", "시점보정", "㎡당가(보정)"]]
+                             .sort_values("계약일", ascending=False), hide_index=True, width="stretch")
+
 with tab_auction:
     if not COMBINED_CSV.exists():
         st.info("combined_result.csv가 없습니다. '⬇️ 데이터 업데이트' 탭에서 경매 분석을 실행하세요.")
@@ -356,6 +490,7 @@ with tab_update:
 
         s = rt_core.collect(u_ds, u_regions, rt_core.month_list(u_from, u_to), force=force, progress=progress)
         st.cache_data.clear()
+        st.cache_resource.clear()
         st.success(f"완료: 새로 받은 월 {s['fetched']}개 ({s['rows']:,}건), 건너뜀 {s['skipped']}개")
         for msg in s["unregistered"]:
             st.warning(msg)
@@ -364,13 +499,11 @@ with tab_update:
 
     st.divider()
     st.subheader("법원경매 vs 시세 분석 (서울남부지법 오피스텔)")
-    st.caption("① 경매 사이트에서 현재 조회 가능한 결과를 수집해 누적 아카이브에 병합 → "
-               "② DB의 오피스텔 매매를 molit_all.csv로 내보내기 → ③ combined_analysis.py 실행")
+    st.caption("① 경매 사이트에서 현재 조회 가능한 물건(입찰 예정 포함)을 수집해 누적 아카이브에 병합 → "
+               "② combined_analysis.py로 과거 낙찰가 vs 시세 재계산 (입찰 도우미의 예상 낙찰가 기준)")
     if st.button("경매 수집 + 분석 다시 실행"):
         steps = [
             [sys.executable, "court_crawler_expanded.py"],
-            [sys.executable, "collect.py", "--legacy-csv", "molit_all.csv",
-             "-r", "서울남부지법 관할 (7개 구)"],
             [sys.executable, "combined_analysis.py"],
         ]
         for cmd in steps:
@@ -382,6 +515,7 @@ with tab_update:
                 st.error(f"실패: {' '.join(cmd[1:])}")
                 break
         st.cache_data.clear()
+        st.cache_resource.clear()
 
     st.divider()
     st.subheader("보유 데이터 현황")
