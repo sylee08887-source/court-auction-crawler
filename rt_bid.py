@@ -8,6 +8,7 @@
    낙찰가/시세는 유찰 횟수와 권리관계에 따라 크게 흔들린다)
 - 추정시세는 '그 가격이 시세의 몇 %인가' 판단에 쓴다
 - 유찰이 많거나 최저가가 시세보다 지나치게 낮으면 권리 인수(선순위 임차인 등) 위험으로 표시
+- rt_rent로 건물의 연 월세회전율(최근 12개월 월세계약 / 전체 호수)을 붙인다
 
 사용법:
     py rt_bid.py            # upcoming_bids.csv 저장 + 상위 후보 출력
@@ -20,6 +21,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import rt_rent
 from rt_match import MultiIndex, match_auction
 
 ARCHIVE_CSV = "court_auction_archive.csv"
@@ -105,9 +107,11 @@ def _num(v):
         return None
 
 
-def evaluate(upcoming, index, history):
-    """입찰 예정 물건별 평가 dict 목록과 {(사건번호, 물건번호): 비교거래} 반환."""
+def evaluate(upcoming, index, history, rent=None, conn=None, fetch_expos=True):
+    """입찰 예정 물건별 평가 dict 목록과 {(사건번호, 물건번호): 비교거래} 반환.
+    rent(rt_rent.RentIndex)를 주면 오늘 기준 연 월세회전율 컬럼(rt_rent.COLUMNS)을 붙인다."""
     out, comps = [], {}
+    today = date.today()
     for row in upcoming:
         m, used = match_auction(row, index)
         comps[(row["사건번호"], row["물건번호"])] = used
@@ -148,6 +152,8 @@ def evaluate(upcoming, index, history):
             rec["판단"] = "시세 대비 저가 예상" if m["시세신뢰도"] != "하" else "저가 예상(시세 신뢰도 낮음)"
         else:
             rec["판단"] = ""
+        if rent is not None:
+            rec.update(rt_rent.calc_rent_turnover(row, rent, today, conn=conn, fetch_expos=fetch_expos))
         out.append(rec)
     return out, comps
 
@@ -166,18 +172,32 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     upcoming = load_upcoming()
     index = MultiIndex.from_db()
-    rows, _ = evaluate(upcoming, index, History())
+    rent = rt_rent.RentIndex.from_db()
+    rt_rent.prefetch(upcoming, rent)  # 건축물대장 병렬 선조회 (캐시돼 있으면 건너뜀)
+    conn = rt_rent.connect()
+    try:
+        rows, _ = evaluate(upcoming, index, History(), rent, conn)
+    finally:
+        conn.close()
     df = pd.DataFrame(rows)
     df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
     has = df["추정시세(만원)"].notna()
     print(f"입찰 예정 {len(df)}건 (시세 산출 {has.sum()}건) -> {OUTPUT_CSV}")
     print("판단: " + ", ".join(f"{k or '(없음)'} {v}" for k, v in df["판단"].value_counts().items()))
+    turn = pd.to_numeric(df["연 월세회전율(%)"], errors="coerce")
+    print(f"연 월세회전율 산출 {turn.notna().sum()}건" + (f" (중위 {turn.median():.1f}%)" if turn.notna().any() else ""))
+    fails = df.loc[turn.isna(), "회전율비고"].fillna("").str.split(r"[(:]|\d{6}", regex=True).str[0].str.strip()
+    if len(fails):
+        print("  미산출 사유: " + ", ".join(f"{k or '(없음)'} {v}" for k, v in fails.value_counts().head(5).items()))
+    for msg in rt_rent._blocked.values():
+        print(f"  [건축물대장] {msg}")
     top = df[df["판단"] == "시세 대비 저가 예상"].sort_values("예상중위/시세(%)").head(15)
     print("\n[시세 대비 저가 예상 상위]")
     for _, r in top.iterrows():
         print(f"  {r['매각기일']} {r['사건번호']}({r['물건번호']}) {r['구']} {r['건물명'] or ''} {r['전용면적(㎡)']}㎡ "
               f"유찰{r['유찰횟수']} 최저 {r['최저입찰가(만원)']:,.0f} / 예상 {r['예상낙찰가_중(만원)']:,.0f} "
               f"/ 시세 {r['추정시세(만원)']:,.0f} ({r['예상중위/시세(%)']}%) [신뢰도 {r['시세신뢰도']}, {r['비교기간']}]")
+        print(f"      {rt_rent.summary_line(r)}")
 
 
 if __name__ == "__main__":

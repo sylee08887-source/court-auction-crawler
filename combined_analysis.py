@@ -4,6 +4,7 @@
 1. court_auction_archive.csv(court_crawler_expanded.py 누적본)에서 낙찰 물건 로드
 2. realestate.db의 오피스텔 매매 실거래와 매칭 (rt_match: 지번 → 동+건물명 → 구+건물명)
 3. 같은 면적대 거래로 추정시세를 계산해 낙찰가/최저가/감정가와 비교
+4. rt_rent로 매각기일 기준 연 월세회전율(최근 12개월 월세계약 / 전체 호수)을 붙인다
 
 출력:
     combined_result.csv   경매 물건당 1행 (추정시세, 낙찰가/시세 등)
@@ -19,9 +20,11 @@ import csv
 import re
 import sys
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from statistics import median
 
+import rt_rent
 from rt_match import MarketIndex, MultiIndex, match_auction
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -118,10 +121,28 @@ def main():
     auctions = load_auctions(start_date, end_date)
     index = load_market()
 
+    rent = rt_rent.RentIndex.from_db()
+    print(f"  전월세 로드: {rent.size:,}건 (" + ", ".join(f"{p} {i.size:,}" for p, i in rent.parts.items()) + ")")
+
+    def sale_date(row):
+        try:
+            return datetime.strptime(row.get("매각기일", "")[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    n = rt_rent.prefetch(auctions, rent, sale_date)  # 건축물대장 병렬 선조회 (캐시돼 있으면 건너뜀)
+    print(f"  건축물대장: 새로 조회 {n}곳")
+    rent_conn = rt_rent.connect()
+
     results, details = [], []
     for row in auctions:
         m, used = match_auction(row, index)
-        results.append({**{k: row.get(k, "") for k in AUCTION_FIELDS}, **m})
+        try:
+            base = datetime.strptime(row.get("매각기일", "")[:10], "%Y-%m-%d").date()
+            turn = rt_rent.calc_rent_turnover(row, rent, base, conn=rent_conn)
+        except ValueError:
+            turn = {**dict.fromkeys(rt_rent.COLUMNS, ""), "회전율비고": "매각기일 없음"}
+        results.append({**{k: row.get(k, "") for k in AUCTION_FIELDS}, **m, **turn})
         for d in sorted(used, key=lambda d: d["deal_date"], reverse=True):
             details.append({
                 "사건번호": row["사건번호"], "물건번호": row["물건번호"], "매각기일": row["매각기일"],
@@ -132,7 +153,8 @@ def main():
                 "매칭_시점보정": d.get("adj", ""),
             })
 
-    write_csv(OUTPUT_CSV, AUCTION_FIELDS + MATCH_FIELDS, results)
+    rent_conn.close()
+    write_csv(OUTPUT_CSV, AUCTION_FIELDS + MATCH_FIELDS + rt_rent.COLUMNS, results)
     write_csv(MATCHES_CSV, DETAIL_FIELDS, details)
 
     matched = [r for r in results if r["추정시세(만원)"] != ""]
@@ -150,6 +172,10 @@ def main():
     ratios = [r["낙찰가/시세(%)"] for r in matched if r["낙찰가/시세(%)"] != ""]
     if ratios:
         print(f"  낙찰가/시세 중위: {median(ratios):.1f}%")
+    turns = [r["연 월세회전율(%)"] for r in results if r["연 월세회전율(%)"] != ""]
+    print(f"  연 월세회전율: {len(turns):,}건 산출" + (f" (중위 {median(turns):.1f}%)" if turns else ""))
+    for msg in rt_rent._blocked.values():
+        print(f"    [건축물대장] {msg}")
     print(f"\n저장: {OUTPUT_CSV} ({len(results)}행), {MATCHES_CSV} ({len(details)}행)")
 
 
