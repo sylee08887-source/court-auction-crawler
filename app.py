@@ -16,6 +16,7 @@ import streamlit as st
 
 import rt_bid
 import rt_core
+import rt_rent
 from rt_core import DATASETS, KOREAN
 from rt_match import MultiIndex
 from rt_regions import CODE_TO_NAME, PRESETS, region_label
@@ -273,14 +274,30 @@ def market_index():
     return MultiIndex.from_db()
 
 
-@st.cache_data(show_spinner="입찰 예정 물건 평가 중...")
+@st.cache_resource(show_spinner="전월세 색인 만드는 중...")
+def rent_index():
+    return rt_rent.RentIndex.from_db()
+
+
+TURN_NUM_COLS = ["전체호수", "월세(12개월)", "신규월세(12개월)", "연 월세회전율(%)", "신규 월세회전율(%)",
+                 "월세(6개월)", "월세 중위보증금(만원)", "월세 중위월세(만원)"]
+
+
+@st.cache_data(show_spinner="입찰 예정 물건 평가 중... (처음엔 건축물대장 조회로 몇 분 걸릴 수 있음)")
 def bid_table():
     if not (BASE_DIR / rt_bid.ARCHIVE_CSV).exists():
         return pd.DataFrame(), {}
     upcoming = rt_bid.load_upcoming(BASE_DIR / rt_bid.ARCHIVE_CSV)
-    rows, comps = rt_bid.evaluate(upcoming, market_index(), bid_history())
+    # 표제부만 선조회. 전유부(오피스텔 호수)는 호출이 많아 `py rt_bid.py` 또는 `py rt_rent.py --prefetch`로 받아 둔 캐시만 쓴다
+    rt_rent.prefetch(upcoming, rent_index(), units=False)
+    conn = rt_rent.connect()
+    try:
+        rows, comps = rt_bid.evaluate(upcoming, market_index(), bid_history(), rent_index(), conn,
+                                      fetch_expos=False)
+    finally:
+        conn.close()
     df = pd.DataFrame(rows)
-    for c in ["층", "전용면적(㎡)", "유찰횟수", "최저가/시세(%)", "감정가/시세(%)", "시점보정(평균)"]:
+    for c in ["층", "전용면적(㎡)", "유찰횟수", "최저가/시세(%)", "감정가/시세(%)", "시점보정(평균)", *TURN_NUM_COLS]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df, {f"{k[0]}|{k[1]}": v for k, v in comps.items()}
 
@@ -332,7 +349,8 @@ with tab_bid:
 
         cols = ["매각기일", "사건번호", "물건번호", "판단", "구", "법정동", "건물명", "층", "전용면적(㎡)", "유찰횟수",
                 "감정가(만원)", "최저입찰가(만원)", "예상낙찰가_하(만원)", "예상낙찰가_중(만원)", "예상낙찰가_상(만원)",
-                "추정시세(만원)", "예상중위/시세(%)", "최저가/시세(%)", "시세신뢰도", "비교기간", "소재지"]
+                "추정시세(만원)", "예상중위/시세(%)", "최저가/시세(%)", "시세신뢰도", "비교기간",
+                "전체호수", "월세(12개월)", "연 월세회전율(%)", "소재지"]
         ev = st.dataframe(v[cols], hide_index=True, width="stretch", height=420, on_select="rerun",
                           selection_mode="single-row", key="bid_table")
         st.download_button("CSV 다운로드", csv_bytes(v[cols]), file_name="입찰예정.csv", mime="text/csv")
@@ -357,6 +375,27 @@ with tab_bid:
             k[2].metric("추정시세", fmt_won(market),
                         f"신뢰도 {r['시세신뢰도'] or '-'} · {r['비교기간'] or ''}", delta_color="off")
             k[3].metric("감정가", fmt_won(r["감정가(만원)"]))
+
+            st.markdown("#### 임대 수요 (연 월세회전율)")
+            t = st.columns(4)
+            turn = r["연 월세회전율(%)"]
+            t[0].metric("연 월세회전율", f"{turn:.1f}%" if pd.notna(turn) else "미산출",
+                        f"신규 {r['신규 월세회전율(%)']:.1f}%" if pd.notna(r["신규 월세회전율(%)"]) else None,
+                        delta_color="off")
+            t[1].metric("전체 호수", f"{r['전체호수']:,.0f}호" if pd.notna(r["전체호수"]) else "-",
+                        r["호수출처"] or None, delta_color="off")
+            t[2].metric("최근 12개월 월세", f"{r['월세(12개월)']:,.0f}건" if pd.notna(r["월세(12개월)"]) else "-",
+                        f"최근 6개월 {r['월세(6개월)']:,.0f}건" if pd.notna(r["월세(6개월)"]) else None,
+                        delta_color="off")
+            t[3].metric("월세 중위 (보증금/월세)",
+                        f"{fmt_won(r['월세 중위보증금(만원)'])} / {fmt_won(r['월세 중위월세(만원)'])}"
+                        if pd.notna(r["월세 중위월세(만원)"]) else "-", delta_color="off")
+            st.caption(f"{rt_rent.summary_line(r)} · 집계기간 {r['월세 집계기간']} · "
+                       f"전월세 매칭 {r['전월세매칭'] or '-'} ({r['전월세유형'] or '-'}) · "
+                       f"건축물대장 {r['대장건물명'] or '-'} {r['대장용도'] or ''}"
+                       + (f" · ⚠️ {r['회전율비고']}" if r["회전율비고"] else "")
+                       + " · 월세회전율 = 최근 12개월 월세계약(보증부월세 포함, 전세·해제 제외) ÷ 전체 호수. "
+                         "최근 1개월은 신고 기한 때문에 덜 잡힙니다.")
 
             st.markdown("#### 입찰가 계산기")
             floor_bid = int(minimum) if pd.notna(minimum) else 0
@@ -410,11 +449,13 @@ with tab_auction:
         else:
             num_cols = ["감정가(만원)", "최저입찰가(만원)", "낙찰가(만원)", "낙찰가율(%)", "유찰횟수", "전용면적(㎡)",
                         "추정시세(만원)", "비교거래수", "낙찰가/시세(%)", "최저가/시세(%)", "감정가/시세(%)"]
-            for c in num_cols:
+            turn_cols = [c for c in ["전체호수", "월세(12개월)", "연 월세회전율(%)", "회전율비고"] if c in ca.columns]
+            for c in num_cols + [c for c in turn_cols if c in TURN_NUM_COLS]:
                 ca[c] = pd.to_numeric(ca[c], errors="coerce")
             cols = ["매각기일", "사건번호", "물건번호", "구", "법정동", "건물명", "층", "전용면적(㎡)",
                     "감정가(만원)", "낙찰가(만원)", "낙찰가율(%)", "유찰횟수", "추정시세(만원)", "낙찰가/시세(%)",
-                    "감정가/시세(%)", "매칭방식", "실거래유형", "매칭건물명", "시세산출", "비교기간", "매칭비고", "소재지"]
+                    "감정가/시세(%)", *turn_cols, "매칭방식", "실거래유형", "매칭건물명", "시세산출", "비교기간",
+                    "매칭비고", "소재지"]
             f1, f2, f3 = st.columns([3, 2, 2])
             a_query = f1.text_input("소재지·건물명 검색", key="auction_q")
             a_gu = f2.multiselect("구", sorted(ca["구"].dropna().unique()), key="auction_gu")
@@ -449,6 +490,8 @@ with tab_auction:
                 k[1].metric("추정시세", fmt_won(sel["추정시세(만원)"]))
                 k[2].metric("감정가", fmt_won(sel["감정가(만원)"]))
                 k[3].metric("낙찰가/시세", f"{sel['낙찰가/시세(%)']:.1f}%" if pd.notna(sel["낙찰가/시세(%)"]) else "-")
+                if "연 월세회전율(%)" in sel.index:
+                    st.caption(f"매각기일 기준 {rt_rent.summary_line(sel.fillna('').to_dict())}")
                 if MATCHES_CSV.exists():
                     mt = pd.read_csv(MATCHES_CSV, encoding="utf-8-sig", dtype=str)
                     mt = mt[(mt["사건번호"] == sel["사건번호"]) & (mt["물건번호"] == sel["물건번호"])
@@ -479,7 +522,9 @@ with tab_update:
                                     value=(all_months[-13], all_months[-1]), format_func=ym_label)
     force = st.checkbox("이미 받은 월도 다시 받기")
     n_jobs = len(u_ds) * len(u_regions) * len(rt_core.month_list(u_from, u_to))
-    st.caption(f"최대 {n_jobs:,}회 API 호출 (개발계정 일일 한도: 데이터셋당 10,000회)")
+    st.caption(f"최대 {n_jobs:,}회 API 호출 (개발계정 일일 한도: 데이터셋당 10,000회) · "
+               "연 월세회전율에는 '오피스텔 전월세'(+아파트 전월세)와 data.go.kr "
+               f"'{rt_rent.BLD_APPLY}' 활용신청이 필요합니다.")
 
     if st.button("수집 시작", type="primary", disabled=not (u_ds and u_regions)):
         bar = st.progress(0.0)
