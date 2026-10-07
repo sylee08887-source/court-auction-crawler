@@ -68,6 +68,7 @@ data.go.kr API (8종) ──► rt_core.fetch_month ──► 정규화(공통 �
 | `combined_analysis.py` | 과거 낙찰 물건 전체에 매칭 적용 → `combined_result.csv`(물건당 1행), `combined_matches.csv`(근거 거래) |
 | `rt_bid.py` | 입찰 예정 물건 평가 → `upcoming_bids.csv` (`py rt_bid.py`) |
 | `rt_rent.py` | 연 월세회전율 (전월세 실거래 + 건축물대장 호수) |
+| `rt_officetel_market.py` | 서울 오피스텔 시장 패널 (방어력·유동성·수익성, 신축 연차곡선) |
 
 **매칭** (`rt_match.py`)
 
@@ -113,6 +114,27 @@ py collect.py -t offi_rent --from 202409            # 전월세 수집 (최근 1
 py rt_rent.py --prefetch                           # 입찰 예정 물건의 건축물대장(표제부+전유부) 병렬 선조회 (처음 한 번 오래 걸림)
 py rt_rent.py --verify 5                           # 월세 많은 오피스텔 5곳: DB 집계 vs API 재조회, 표제부/전유부 호수, 회전율
 py rt_rent.py --case 2025타경11836                  # 특정 물건: "전체호수 216 / 최근12개월 월세 31건 / 연 월세회전율 14.4%"
+```
+
+**서울 오피스텔 시장 패널** (`rt_officetel_market.py`, 앱 `🛡️ 오피스텔 시장` 탭)
+
+지역 방어력·유동성·수익성을 raw 지표로 만든다. **종합점수는 아직 없다** — 서울 분포(p10~p90)와 가중치 없는 Pareto 후보만.
+
+- 단위: 단지(시군구코드+법정동+지번, 이름 매칭 없음) × 면적군(10~20/20~30/30~40/40~60/60+㎡) + 단지 전체 행. 법정동·구는 단지 지표의 `stock_units` 가중평균과 단지 중위값, `top1/top3_stock_share`.
+- 분모: `rt_rent` 건축물대장 캐시의 전유부 오피스텔 호수(`building_unit_areas`로 면적군별까지). `stock_quality` A(면적별) / B(단지 전체로 나눔) / C(표제부, 상가 포함 가능) / D(없음).
+- 유동성: 회전율 = 건수 ÷ 호수. 절대 건수는 `sample_n`/`trade_n_12m`으로만 보존. 거래 있는 달 비율, 최대 월 비중(한 달 쏠림 flag). 임대회전율은 공실률이 아니라 임대유동성. 회전율 > 100%는 자동 오류.
+- 가격방어: 단지×면적군 ㎡당가 연간 중위 → 3·5년 CAGR, 상승 연도 비율 / 2분기 창 중위 → MDD. 분양·입주 초기 대량거래 달과 같은 날 5건+ 일괄거래는 가격 산정에서 제외(회전율에는 포함). 중복 의심 거래는 지우지 않고 `dup_trades`로 표시(API에 호수가 없어 일괄매각과 구분 불가).
+- 신축효과: 거래 ㎡당가 ÷ 서울 성숙 재고(5년차+) 분기지수 → 같은 단지×면적군의 연차 a-1→a 변화 중위를 누적(`officetel_age_curve.csv`). 6~10년차의 정상 감가 속도로 수렴하는 첫 연차가 T(`--maturity auto`), `mature_price_cagr`는 연차 ≥ T 거래만.
+- 수익률: ㎡당 중위 월세 × 12 ÷ ㎡당 중위 매매가(`gross_yield`), 보증금 환산(`gross_yield_equiv`, `conversion_rate` 기록, 기본 5%). 경매 낙찰가 기준은 아직 섞지 않음.
+- 기준일: 신고기한 30일이 지난 마지막 월말(최근 달 과소집계 방지). `--asof`로 지정.
+
+```bash
+py rt_officetel_market.py --collect --from 201501 --to 202609   # 서울 오피스텔 매매·전월세 (증분)
+py rt_officetel_market.py --build-stock                          # 서울 전 단지 건축물대장 (거래 많은 단지부터, 한도 걸리면 다음 날 같은 명령)
+py rt_officetel_market.py                                        # → officetel_complex/dong/gu_metrics.csv, officetel_age_curve.csv,
+                                                                 #   officetel_distribution.csv, pareto_candidates.csv
+py rt_officetel_market.py --maturity 4 --conv-rate 0.055
+py rt_officetel_market.py --verify                               # 마곡·당산/영등포·구로/신도림·목동·강남 10개 단지 검증표
 ```
 
 **다음 개선 후보**

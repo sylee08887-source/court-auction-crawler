@@ -68,6 +68,15 @@ COLUMNS = [
 
 _blocked = {}  # 이번 실행에서 막힌 API (미등록/한도) → 메시지
 
+# 전용면적 구간 (rt_officetel_market의 면적군과 공유)
+AREA_BINS = [(20, "10~20"), (30, "20~30"), (40, "30~40"), (60, "40~60"), (float("inf"), "60+")]
+
+
+def area_bin(area):
+    if not area:
+        return ""
+    return next(label for upper, label in AREA_BINS if area < upper)
+
 
 # ── 저장소 ───────────────────────────────────────────
 
@@ -86,6 +95,11 @@ def connect(db_path=rt_core.DB_PATH):
             building_name TEXT, dong_name TEXT, unit_use TEXT, n INTEGER, fetched_at TEXT);
         CREATE INDEX IF NOT EXISTS ix_building_units_parcel
             ON building_units(sgg_cd, bjdong_cd, plat_gb, bun, ji);
+        CREATE TABLE IF NOT EXISTS building_unit_areas (
+            sgg_cd TEXT, bjdong_cd TEXT, plat_gb TEXT, bun TEXT, ji TEXT,
+            building_name TEXT, unit_use TEXT, area_bin TEXT, n INTEGER, fetched_at TEXT);
+        CREATE INDEX IF NOT EXISTS ix_building_unit_areas_parcel
+            ON building_unit_areas(sgg_cd, bjdong_cd, plat_gb, bun, ji);
         CREATE TABLE IF NOT EXISTS building_fetch (
             sgg_cd TEXT, bjdong_cd TEXT, plat_gb TEXT, bun TEXT, ji TEXT, kind TEXT, fetched_at TEXT,
             n INTEGER, PRIMARY KEY (sgg_cd, bjdong_cd, plat_gb, bun, ji, kind));
@@ -233,17 +247,29 @@ def fetch_units(conn, parcel, key):
 
 def save_units(conn, parcel, items):
     hos = {}
+    unit_area = {}  # (건물명, 동, 용도, 층구분, 호) -> 전유면적 합 (복층 등 한 호에 전유 행이 여럿)
     for it in items:
         if str(it.get("exposPubuseGbCd") or "").strip() != "1":  # 1=전유, 2=공용
             continue
         k = ((it.get("bldNm") or "").strip(), (it.get("dongNm") or "").strip(),
              f"{(it.get('mainPurpsCdNm') or '').strip()}|{(it.get('etcPurps') or '').strip()}")
-        hos.setdefault(k, set()).add(((it.get("flrGbCdNm") or ""), (it.get("hoNm") or "").strip()))
+        ho = ((it.get("flrGbCdNm") or ""), (it.get("hoNm") or "").strip())
+        hos.setdefault(k, set()).add(ho)
+        try:
+            unit_area[(*k, *ho)] = unit_area.get((*k, *ho), 0.0) + float(it.get("area") or 0)
+        except (TypeError, ValueError):
+            pass
+    by_bin = {}
+    for (b, _d, u, *_), a in unit_area.items():
+        by_bin[(b, u, area_bin(a))] = by_bin.get((b, u, area_bin(a)), 0) + 1
     now = datetime.now().isoformat(timespec="seconds")
     with conn:
         conn.execute(f"DELETE FROM building_units WHERE {_parcel_where()}", parcel)
         conn.executemany("INSERT INTO building_units VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                          [(*parcel, b, d, u, len(s), now) for (b, d, u), s in hos.items()])
+        conn.execute(f"DELETE FROM building_unit_areas WHERE {_parcel_where()}", parcel)
+        conn.executemany("INSERT INTO building_unit_areas VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         [(*parcel, b, u, ab, n, now) for (b, u, ab), n in by_bin.items()])
         conn.execute("INSERT OR REPLACE INTO building_fetch VALUES (?, ?, ?, ?, ?, 'units', ?, ?)",
                      (*parcel, now, len(hos)))
 
@@ -318,6 +344,8 @@ def get_building_stock(conn, sgg_cd, umd, jibun, prop="오피스텔", name="", k
     picked_names = None
     if len(names) > 1:
         picked = [t for t in main if t["bld"] and name and name_score(t["bld"], name) >= BLD_NAME_MIN_SCORE]
+        if not picked and norm_name(name) and all(norm_name(name) in n for n in names):
+            picked = main  # '골든애비뉴' ↔ '골든애비뉴제1동'/'골든애비뉴제2동': 한 단지의 동들 → 합산
         if not picked:
             out["note"] = f"한 지번에 건물 {len(names)}개 - 건물명으로 특정 불가"
             return out
@@ -557,10 +585,8 @@ def prefetch(rows, rent_index, base_date=None, workers=6, progress=None, units=T
     경매 물건들의 건축물대장을 병렬로 미리 받아 캐시한다 (API 응답이 호출당 수 초라 순차 조회는 느림).
     rows: 경매 dict 목록. base_date: 날짜 또는 row -> 날짜 함수. 반환: 새로 조회한 지번 수.
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     if "bld" in _blocked:
         return 0
-    progress = progress or (lambda done, total, msg: None)
     conn = connect()
     try:
         parcels, props = {}, {}
@@ -581,6 +607,24 @@ def prefetch(rows, rent_index, base_date=None, workers=6, progress=None, units=T
             if bj:
                 parcels[(sgg_cd, bj, *pj)] = jibun
                 props[(sgg_cd, bj, *pj)] = rd["match"][4]
+    finally:
+        conn.close()
+    return prefetch_parcels(parcels, props, workers, progress, units)
+
+
+def prefetch_parcels(parcels, props, workers=6, progress=None, units=True, force_units=()):
+    """
+    지번 목록의 표제부(+필요하면 전유부)를 병렬로 받아 캐시. 캐시가 유효하면 건너뛴다.
+    parcels: {(sgg_cd, bjdong_cd, plat_gb, bun, ji): 지번}, props: {같은 키: 실거래 유형}
+    force_units: 캐시가 있어도 전유부를 다시 받을 지번 (예: 면적별 호수가 없는 예전 캐시)
+    반환: 새로 조회한 지번 수 (표제부 + 전유부). 미등록·한도 초과면 _blocked에 남기고 멈춘다.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    if "bld" in _blocked:
+        return 0
+    progress = progress or (lambda done, total, msg: None)
+    conn = connect()
+    try:
         key = rt_core.load_service_key()
 
         def run(kind, jobs):
@@ -612,7 +656,8 @@ def prefetch(rows, rent_index, base_date=None, workers=6, progress=None, units=T
         run("title", titles)
         unit_jobs = []
         for pc in parcels if units else []:
-            if "bld" in _blocked or not _has(conn, pc, "title") or _is_fresh(conn, pc, "units"):
+            if "bld" in _blocked or not _has(conn, pc, "title") or (
+                    _is_fresh(conn, pc, "units") and pc not in force_units):
                 continue
             cur = conn.execute(f"""SELECT main_use, etc_use, main_atch, households, units FROM buildings
                                    WHERE {_parcel_where()}""", pc)

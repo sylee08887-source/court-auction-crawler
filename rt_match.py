@@ -30,7 +30,7 @@ MIN_AREA = 10                # 이보다 작은 물건(지분·상가 일부 등
 ADJ_CLIP = (0.6, 1.4)        # 시점보정 계수 허용 범위
 INDEX_MIN_DEALS = 15         # 분기 지수 산출 최소 거래수 (전후 분기 포함)
 NAME_MIN_SCORE = 0.75        # 같은 동 안에서 건물명 매칭 기준
-NAME_MIN_SCORE_GU = 0.9      # 구 전체에서 건물명 매칭 기준
+NAME_MIN_SCORE_GU = 1.0      # 구 전체에서는 건물명 완전일치만 (0.9면 어반스테이→당산어반스테이 같은 오매칭)
 
 
 # ── 주소/이름 정규화 ─────────────────────────────────
@@ -44,11 +44,24 @@ def bonbun(j):
     return norm_jibun(j).split("-")[0] if j else ""
 
 
+ROMAN = str.maketrans({"Ⅰ": "1", "Ⅱ": "2", "Ⅲ": "3", "Ⅳ": "4", "Ⅴ": "5",
+                       "Ⅵ": "6", "Ⅶ": "7", "Ⅷ": "8", "Ⅸ": "9", "Ⅹ": "10"})
+SPELLED_LETTER = {"에이": "a", "비": "b", "씨": "c"}
+
+
 def norm_name(name):
-    s = re.sub(r"\(.*?\)", "", str(name or ""))
+    s = re.sub(r"\(.*?\)", "", str(name or "")).translate(ROMAN)
     s = re.sub(r"[^0-9A-Za-z가-힣]", "", s).lower()
     s = s.replace("오피스텔", "")
+    # '웰타운비' / '더하우스에이동' → '웰타운b' / '더하우스a동' (끝에 붙은 동 구분 글자)
+    s = re.sub(r"(?<=[가-힣\d]{2})(에이|비|씨)(동?)$", lambda m: SPELLED_LETTER[m.group(1)] + m.group(2), s)
     return s
+
+
+def name_variant(norm):
+    """같은 이름 계열의 다른 건물을 가르는 표식: 숫자(2차, 315, Ⅱ)와 끝의 A/B 동 글자."""
+    letter = re.search(r"(?<=[가-힣\d])([a-z])동?$", norm)
+    return tuple(re.findall(r"\d+", norm)) + ((letter.group(1),) if letter else ())
 
 
 def name_score(a, b):
@@ -57,6 +70,9 @@ def name_score(a, b):
         return 0.0
     if a == b:
         return 1.0
+    # 예가채2 ↔ 예가채, 웰타운b ↔ 웰타운a, 칸타빌레8차 ↔ 칸타빌레 는 다른 건물
+    if name_variant(a) != name_variant(b):
+        return 0.0
     short, long_ = sorted((a, b), key=len)
     if len(short) >= 3 and short in long_:
         return 0.95
