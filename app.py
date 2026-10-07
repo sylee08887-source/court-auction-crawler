@@ -16,6 +16,7 @@ import streamlit as st
 
 import rt_bid
 import rt_core
+import rt_officetel_market as rom
 import rt_rent
 from rt_core import DATASETS, KOREAN
 from rt_match import MultiIndex
@@ -161,8 +162,8 @@ df = df.sort_values("deal_date", ascending=False)
 
 # ── 화면 ───────────────────────────────────────────
 
-tab_search, tab_complex, tab_trend, tab_bid, tab_auction, tab_update = st.tabs(
-    ["🔎 거래 검색", "🏢 단지별", "📈 추이", "🎯 입찰 도우미", "⚖️ 경매 vs 시세", "⬇️ 데이터 업데이트"])
+tab_search, tab_complex, tab_trend, tab_bid, tab_auction, tab_market, tab_update = st.tabs(
+    ["🔎 거래 검색", "🏢 단지별", "📈 추이", "🎯 입찰 도우미", "⚖️ 경매 vs 시세", "🛡️ 오피스텔 시장", "⬇️ 데이터 업데이트"])
 
 
 def show_metrics(d):
@@ -497,6 +498,199 @@ with tab_auction:
                     mt = mt[(mt["사건번호"] == sel["사건번호"]) & (mt["물건번호"] == sel["물건번호"])
                             & (mt["매각기일"] == sel["매각기일"])]
                     st.dataframe(mt.drop(columns=["사건번호", "물건번호", "매각기일"]), hide_index=True, width="stretch")
+
+
+MARKET_METRICS = {
+    "가격방어": ["mature_price_cagr", "price_cagr_5y", "price_cagr_3y", "mdd_5y", "mdd_3y", "positive_year_ratio"],
+    "매매유동성": ["trade_turnover_12m", "trade_turnover_24m_ann", "trade_turnover_36m_ann", "active_trade_month_ratio",
+                "max_trade_month_share"],
+    "임대유동성": ["rent_turnover_12m", "monthly_rent_turnover_12m", "new_contract_turnover_12m", "active_rent_month_ratio"],
+    "수익률": ["gross_yield", "gross_yield_equiv"],
+}
+MARKET_ALL = [m for ms in MARKET_METRICS.values() for m in ms]
+MARKET_LABEL = {
+    "mature_price_cagr": "성숙기 가격 CAGR(%)", "price_cagr_5y": "5년 가격 CAGR(%)", "price_cagr_3y": "3년 가격 CAGR(%)",
+    "mdd_5y": "5년 MDD(%)", "mdd_3y": "3년 MDD(%)", "positive_year_ratio": "상승 연도 비율",
+    "trade_turnover_12m": "매매회전율 12m(%)", "trade_turnover_24m_ann": "매매회전율 24m 연환산(%)",
+    "trade_turnover_36m_ann": "매매회전율 36m 연환산(%)", "active_trade_month_ratio": "거래 있는 달 비율",
+    "max_trade_month_share": "최대 월 거래 비중", "rent_turnover_12m": "임대회전율 12m(%)",
+    "monthly_rent_turnover_12m": "월세회전율 12m(%)", "new_contract_turnover_12m": "신규계약 회전율 12m(%)",
+    "active_rent_month_ratio": "임대 있는 달 비율", "gross_yield": "월세수익률(%)", "gross_yield_equiv": "환산수익률(%)",
+}
+MARKET_NUM = ["stock_units", "연식", "건축년도", "trade_n_12m", "rent_n_12m", "top1_stock_share", "top3_stock_share",
+              "sample_n_price", "sample_n_rent", "initial_supply_event", "chain_index", "yoy_change_median", "is_T",
+              "n_pairs", "age"]
+
+
+@st.cache_data(show_spinner="시장 패널 불러오는 중...")
+def load_market(mtime):
+    out = {}
+    for name, f in [("complex", rom.OUT_COMPLEX), ("dong", rom.OUT_DONG), ("gu", rom.OUT_GU), ("age", rom.OUT_AGE),
+                    ("pareto", rom.OUT_PARETO)]:
+        path = BASE_DIR / f
+        df = pd.read_csv(path, encoding="utf-8-sig", dtype={"시군구코드": str, "지번": str}) \
+            if path.exists() and path.stat().st_size > 5 else pd.DataFrame()
+        for c in df.columns:
+            if c in MARKET_ALL or c in MARKET_NUM or c.endswith("_median"):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        out[name] = df
+    return out
+
+
+def _fmt(v, spec, suffix=""):
+    return f"{v:{spec}}{suffix}" if pd.notna(v) else "-"
+
+
+with tab_market:
+    mk_path = BASE_DIR / rom.OUT_COMPLEX
+    if not mk_path.exists():
+        st.info("시장 패널이 없습니다. 터미널에서 순서대로 실행하세요:\n\n"
+                "`py rt_officetel_market.py --collect --from 201501` → `py rt_officetel_market.py --build-stock` → "
+                "`py rt_officetel_market.py`")
+    else:
+        mk = load_market(mk_path.stat().st_mtime)
+        cx = mk["complex"]
+        st.caption(f"기준일 {cx['asof'].iloc[0] if len(cx) else '-'} · 성숙 연차 T = "
+                   f"{cx['maturity_age'].iloc[0] if len(cx) else '-'} · 회전율 = 거래(계약)건수 ÷ 오피스텔 호수(건축물대장). "
+                   "임대회전율은 공실률이 아니라 임대유동성. **종합점수는 아직 없음** — raw 지표와 분포만 봅니다.")
+        f1, f2, f3, f4, f5 = st.columns([1.2, 2, 2, 1.3, 1.3])
+        level = f1.radio("단위", ["법정동", "구", "단지"], key="mk_level")
+        m_gu = f2.multiselect("구", sorted(cx["시군구"].dropna().unique()), key="mk_gu")
+        dong_pool = cx[cx["시군구"].isin(m_gu)] if m_gu else cx
+        m_dong = f3.multiselect("법정동", sorted(dong_pool["법정동"].dropna().unique()), key="mk_dong")
+        m_bin = f4.selectbox("면적군(㎡)", [rom.ALL, *rom.AREA_LABELS], key="mk_bin")
+        min_stock = f5.number_input("최소 재고(호)", min_value=0, value=50 if level == "단지" else 300, step=50,
+                                    key=f"mk_min_{level}")
+        base = {"단지": cx, "법정동": mk["dong"], "구": mk["gu"]}[level]
+        v = base[base["area_bin"] == m_bin] if len(base) else base
+        if m_gu:
+            v = v[v["시군구"].isin(m_gu)]
+        if m_dong and level != "구":
+            v = v[v["법정동"].isin(m_dong)]
+        v = v[v["stock_units"].fillna(0) >= min_stock]
+        if level == "단지" and len(cx):
+            g1, g2 = st.columns(2)
+            ages = cx["연식"].dropna()
+            if len(ages):
+                lo, hi = int(ages.min()), int(ages.max())
+                age_rng = g1.slider("연식(년)", lo, hi, (lo, hi), key="mk_age")
+                v = v[v["연식"].between(*age_rng)]
+            quals = sorted(cx["stock_quality"].dropna().unique())
+            qual = g2.multiselect("재고 품질", quals, default=[q for q in quals if q[0] in "AB"], key="mk_qual")
+            if qual:
+                v = v[v["stock_quality"].isin(qual)]
+
+        st.markdown(f"#### 분포 ({level} {len(v):,}곳)")
+        dist = []
+        for fam, ms in MARKET_METRICS.items():
+            for m in ms:
+                s = v[m].dropna() if m in v.columns else pd.Series(dtype=float)
+                if len(s):
+                    dist.append({"구분": fam, "지표": MARKET_LABEL[m], "n": len(s),
+                                 **{f"p{q}": round(s.quantile(q / 100), 2) for q in (10, 25, 50, 75, 90)}})
+        st.dataframe(pd.DataFrame(dist), hide_index=True, width="stretch")
+
+        opts = [m for m in MARKET_ALL if m in v.columns]
+        if opts:
+            s1, s2 = st.columns(2)
+            xm = s1.selectbox("X축", opts, index=opts.index("trade_turnover_12m"), format_func=MARKET_LABEL.get,
+                              key="mk_x")
+            ym_ = s2.selectbox("Y축", opts, index=opts.index("mature_price_cagr"), format_func=MARKET_LABEL.get,
+                               key="mk_y")
+            pts = v.dropna(subset=[xm, ym_])
+            if len(pts):
+                tips = [c for c in ["시군구", "법정동", "단지명", "stock_units", xm, ym_, "gross_yield", "rent_turnover_12m"]
+                        if c in pts.columns]
+                st.altair_chart(alt.Chart(pts).mark_circle(opacity=0.7).encode(
+                    x=alt.X(f"{xm}:Q", title=MARKET_LABEL[xm]), y=alt.Y(f"{ym_}:Q", title=MARKET_LABEL[ym_]),
+                    size=alt.Size("stock_units:Q", title="재고(호)"), color=alt.Color("시군구:N", legend=None),
+                    tooltip=list(dict.fromkeys(tips))).properties(height=380).interactive(), width="stretch")
+                st.caption(f"{len(pts):,}곳 표시 (두 지표가 모두 있는 곳). 원 크기 = 오피스텔 호수.")
+
+            st.markdown("#### 지표별 정렬")
+            sort_by = st.selectbox("정렬 기준", opts, index=opts.index("mature_price_cagr"),
+                                   format_func=MARKET_LABEL.get, key="mk_sort")
+            id_cols = {"단지": ["시군구", "법정동", "단지명", "지번", "건축년도", "연식", "stock_quality"],
+                       "법정동": ["시군구", "법정동", "n_complexes", "top1_stock_share", "top3_stock_share"],
+                       "구": ["시군구", "n_complexes", "top1_stock_share", "top3_stock_share"]}[level]
+            show = [c for c in id_cols + ["stock_units"] + opts + ["trade_n_12m", "rent_n_12m", "sample_n_price",
+                                                                   "confidence", "error"] if c in v.columns]
+            table = v.sort_values(sort_by, ascending=sort_by == "max_trade_month_share", na_position="last")[show]
+            ev = st.dataframe(table.rename(columns=MARKET_LABEL), hide_index=True, width="stretch", height=380,
+                              on_select="rerun", selection_mode="single-row", key=f"mk_table_{level}")
+            st.download_button("CSV 다운로드", csv_bytes(table), file_name=f"오피스텔시장_{level}.csv", mime="text/csv")
+
+            if level == "단지" and ev.selection.rows:
+                r = table.iloc[ev.selection.rows[0]]
+                row = cx[(cx["시군구"] == r["시군구"]) & (cx["법정동"] == r["법정동"]) & (cx["지번"] == r["지번"])
+                         & (cx["area_bin"] == m_bin)].iloc[0]
+                st.markdown(f"### {r['단지명']} — {r['시군구']} {r['법정동']} {r['지번']} (준공 {r['건축년도']})")
+                k = st.columns(4)
+                k[0].metric("오피스텔 호수", _fmt(row["stock_units"], ",.0f"), row["stock_quality"], delta_color="off")
+                k[1].metric("매매회전율 12m", _fmt(row["trade_turnover_12m"], ".1f", "%"),
+                            f"{_fmt(row['trade_n_12m'], '.0f')}건", delta_color="off")
+                k[2].metric("임대회전율 12m", _fmt(row["rent_turnover_12m"], ".1f", "%"),
+                            f"월세 {_fmt(row['monthly_rent_turnover_12m'], '.1f', '%')}", delta_color="off")
+                k[3].metric("월세수익률", _fmt(row["gross_yield"], ".2f", "%"),
+                            f"환산 {_fmt(row['gross_yield_equiv'], '.2f', '%')} (전환율 {row['conversion_rate']})",
+                            delta_color="off")
+                st.caption("가격방어: " + " · ".join(f"{MARKET_LABEL[m]} {row[m]}" for m in MARKET_METRICS["가격방어"]
+                                                     if pd.notna(row[m])) + f" · 가격 신뢰도 {row['price_confidence']}"
+                           + (" · ⚠️ 분양·입주 초기 대량거래 있음(가격 산정 제외)" if row["initial_supply_event"] == 1 else "")
+                           + (f" · ⚠️ {row['error']}" if isinstance(row["error"], str) and row["error"] else ""))
+                deals = pd.DataFrame(rom.complex_deals(row["시군구코드"], r["법정동"], str(r["지번"])))
+                if len(deals):
+                    deals["deal_date"] = pd.to_datetime(deals["deal_date"])
+                    if m_bin != rom.ALL:
+                        deals = deals[deals["area_bin"] == m_bin]
+                    tr = deals[deals["dataset"] == "offi_trade"].dropna(subset=["price"]).copy()
+                    if len(tr):
+                        tr["㎡당가"] = tr["price"] / tr["area"]
+                        tr["분기"] = tr["deal_date"].dt.to_period("Q").dt.start_time
+                        qm = tr.groupby("분기").agg(중위=("㎡당가", "median"), 건수=("㎡당가", "size")).reset_index()
+                        dots = alt.Chart(tr).mark_circle(size=25, opacity=0.35).encode(
+                            x=alt.X("deal_date:T", title=None),
+                            y=alt.Y("㎡당가:Q", title="㎡당 매매가(만원)", scale=alt.Scale(zero=False)),
+                            tooltip=["deal_date:T", "area", "floor", "price"])
+                        line = alt.Chart(qm[qm["건수"] >= 2]).mark_line(point=True, color="#d62728").encode(
+                            x="분기:T", y="중위:Q", tooltip=["분기:T", alt.Tooltip("중위:Q", format=",.0f"), "건수"])
+                        st.altair_chart((dots + line).properties(
+                            height=280, title="매매 ㎡당가 (점 = 거래, 선 = 분기 중위 2건 이상)"), width="stretch")
+                    rn = deals[(deals["dataset"] == "offi_rent") & (deals["monthly_rent"].fillna(0) > 0)].copy()
+                    if len(rn):
+                        rn["월"] = rn["deal_date"].dt.to_period("M").dt.start_time
+                        mon = rn.groupby("월").agg(월세계약=("monthly_rent", "size"),
+                                                   중위월세=("monthly_rent", "median")).reset_index()
+                        st.altair_chart(alt.Chart(mon).mark_bar().encode(
+                            x=alt.X("월:T", title=None), y=alt.Y("월세계약:Q", title="월세 계약 수"),
+                            tooltip=["월:T", "월세계약", "중위월세"]).properties(height=180, title="월별 월세 계약"),
+                            width="stretch")
+
+        st.markdown("#### Pareto 후보 (가중치 없음)")
+        st.caption("가격방어(성숙기 CAGR, 없으면 5년 CAGR) 상위 25% ∧ 매매회전율 상위 25% ∧ 임대회전율 상위 25% ∧ "
+                   "월세수익률 상위 50%의 교집합. 법정동은 재고 300호+, 단지는 50호+ 중에서. 최종 점수는 결과를 보고 2차 결정.")
+        pa = mk["pareto"]
+        if len(pa):
+            st.dataframe(pa[[c for c in ["level", "시군구", "법정동", "단지명", "stock_units", "defense_metric",
+                                         "mature_price_cagr", "price_cagr_5y", "trade_turnover_12m",
+                                         "rent_turnover_12m", "gross_yield", "top1_stock_share", "thresholds"]
+                             if c in pa.columns]], hide_index=True, width="stretch")
+        else:
+            st.info("네 조건을 모두 만족하는 후보가 없습니다 (지표 간 trade-off가 크다는 뜻).")
+
+        age = mk["age"]
+        if len(age) and "chain_index" in age.columns:
+            st.markdown("#### 신축 연차별 가격곡선 (서울)")
+            st.caption("같은 단지×면적군이 연차 a-1 → a로 갈 때 ㎡당가 변화(서울 성숙 재고 분기지수 대비)의 중위를 누적. "
+                       "정상 감가 속도로 수렴하는 첫 연차가 T(빨간 선).")
+            ag = age[age["chain_index"].notna()]
+            curve = alt.Chart(ag).mark_line(point=True).encode(
+                x=alt.X("age:Q", title="건물 연차 (거래연도 - 건축연도)"),
+                y=alt.Y("chain_index:Q", title="누적 지수 (0년차 = 1)", scale=alt.Scale(zero=False)),
+                tooltip=["age", "chain_index", "yoy_change_median", "n_pairs"])
+            rule = alt.Chart(ag[ag["is_T"] == 1]).mark_rule(color="red").encode(x="age:Q")
+            st.altair_chart((curve + rule).properties(height=260), width="stretch")
+
 
 with tab_update:
     st.subheader("국토부 실거래가 수집")
